@@ -1,24 +1,24 @@
 import os
 import io
 import base64
+import time
 import requests
-from PIL import Image
+from dotenv import load_dotenv
+from PIL import Image, ImageFilter, ImageOps, ImageEnhance
+from .cache import get as cache_get, set as cache_set
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing in environment")
+load_dotenv()
 
-# OpenAI Images Edit endpoint (use for img2img style transform)
-# Docs: Images API (create/edit) + output options (size, quality, format, background)
-# https://platform.openai.com/docs/api-reference/images/createEdit
-# https://platform.openai.com/docs/guides/image-generation
+# --- Config (env-driven) ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")                # may be None; handled at call time
+IMAGE_MODEL    = os.getenv("GPT_IMAGE_MODEL", "gpt-image-1")
+IMG_SIZE       = os.getenv("GPT_IMAGE_SIZE", "1536x1536")
+IMG_QUALITY    = os.getenv("GPT_IMAGE_QUALITY", "high")
+IMG_FORMAT     = "png"
+TIMEOUT_S      = int(os.getenv("GPT_IMAGE_TIMEOUT_S", "90"))
+ALLOW_FALLBACK = os.getenv("GPT_ALLOW_FALLBACK_WITHOUT_KEY", "false").lower() == "true"
+
 IMAGES_EDIT_URL = "https://api.openai.com/v1/images/edits"
-
-# Tunables (balance latency vs quality for booth speed)
-IMG_SIZE = os.getenv("GPT_IMAGE_SIZE", "1536x1536")  # 1024x1024, 1024x1536, 1536x1536, etc.
-IMG_QUALITY = os.getenv("GPT_IMAGE_QUALITY", "high") # low|medium|high (per docs)
-IMG_FORMAT = "png"                                   # want PNG for transparency
-TIMEOUT_S = 90
 
 PROMPT = (
     "Convert this portrait photo into a high-quality cartoon/hand-drawn comic style while KEEPING "
@@ -28,11 +28,6 @@ PROMPT = (
 )
 
 def _decode_image_payload(json_obj: dict) -> bytes:
-    """
-    Handle possible payload shapes from Images API.
-    Historically: {'data':[{'b64_json':'...'}]}
-    Some clients may return {'data':[{'image_base64':'...'}]}.
-    """
     data = json_obj.get("data", [])
     if not data:
         raise ValueError("Empty image data in API response")
@@ -42,56 +37,76 @@ def _decode_image_payload(json_obj: dict) -> bytes:
         raise ValueError("No base64 image payload found")
     return base64.b64decode(b64)
 
-def _has_alpha(png_bytes: bytes) -> bool:
-    try:
-        im = Image.open(io.BytesIO(png_bytes))
-        return im.mode in ("LA", "RGBA", "PA") or ("transparency" in im.info)
-    except Exception:
-        return False
-
-def cartoonize_with_bg_remove(photo_bytes: bytes) -> bytes:
+def _local_cartoon_fallback(photo_bytes: bytes) -> bytes:
     """
-    Send captured photo to OpenAI Images Edit API (gpt-image-1) to stylize as cartoon
-    with transparent background, returning high-res PNG bytes.
+    Simple, fast local stylization (no BG removal) — last resort to keep booth running.
     """
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
-    }
+    im = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+    base = ImageOps.posterize(im, 3)
+    base = ImageEnhance.Color(base).enhance(1.2)
+    base = ImageEnhance.Sharpness(base).enhance(1.3)
 
-    # First attempt: high quality, requested transparent BG
-    files = {
-        "image[]": ("input.png", photo_bytes, "image/png"),
-    }
+    edges = im.convert("L").filter(ImageFilter.FIND_EDGES).filter(ImageFilter.SMOOTH_MORE)
+    edges_col = ImageOps.colorize(edges, black=(10,10,10), white=(255,255,255))
+    out = Image.blend(base, edges_col, alpha=0.15).convert("RGBA")
+
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
+
+def cartoonize_with_bg_remove(photo_bytes: bytes, *, force_fresh: bool = False) -> tuple[bytes, bool]:
+    """
+    Returns: (png_bytes, used_fallback: bool)
+    - Uses disk cache (unless force_fresh=True)
+    - Calls OpenAI Images Edit with background=transparent
+    - Falls back to local stylize on error (or when key missing and ALLOW_FALLBACK is true)
+    """
+    # 0) If key missing, decide whether to fallback or error
+    if not OPENAI_API_KEY:
+        if ALLOW_FALLBACK:
+            png_bytes = _local_cartoon_fallback(photo_bytes)
+            return png_bytes, True
+        raise RuntimeError("OPENAI_API_KEY not set. Please configure it on the server.")
+
+    # 1) Cache check (skip when force_fresh)
+    if not force_fresh:
+        cached = cache_get("cartoon", photo_bytes, IMAGE_MODEL, IMG_SIZE, IMG_QUALITY, "v1")
+        if cached:
+            return cached, False
+
+    # 2) Call OpenAI (with fallback size)
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    files = {"image[]": ("input.png", photo_bytes, "image/png")}
     data = {
-        "model": "gpt-image-1",
+        "model": IMAGE_MODEL,
         "prompt": PROMPT,
-        "size": IMG_SIZE,              # e.g. 1536x1536
-        "quality": IMG_QUALITY,        # high
-        "background": "transparent",   # request alpha BG (per docs)
-        "format": IMG_FORMAT,          # png
+        "size": IMG_SIZE,
+        "quality": IMG_QUALITY,
+        "background": "transparent",
+        "format": IMG_FORMAT,
         "n": "1",
     }
 
-    resp = requests.post(IMAGES_EDIT_URL, headers=headers, files={**files}, data=data, timeout=TIMEOUT_S)
-    if resp.status_code != 200:
-        # Fallback: try a smaller size to reduce latency/cost if first fails
-        try_small = requests.post(
-            IMAGES_EDIT_URL,
-            headers=headers,
-            files={**files},
-            data={**data, "size": "1024x1024"},
-            timeout=TIMEOUT_S
-        )
-        if try_small.status_code != 200:
-            raise RuntimeError(f"OpenAI image edit error: {resp.status_code} {resp.text} / fallback: {try_small.status_code} {try_small.text}")
-        png_bytes = _decode_image_payload(try_small.json())
-    else:
-        png_bytes = _decode_image_payload(resp.json())
+    t0 = time.time()
+    try:
+        resp = requests.post(IMAGES_EDIT_URL, headers=headers, files=files, data=data, timeout=TIMEOUT_S)
+        if resp.status_code != 200:
+            # fallback: try smaller size once
+            data_small = {**data, "size": "1024x1024"}
+            resp2 = requests.post(IMAGES_EDIT_URL, headers=headers, files=files, data=data_small, timeout=TIMEOUT_S)
+            if resp2.status_code != 200:
+                png_bytes = _local_cartoon_fallback(photo_bytes)
+                return png_bytes, True
+            png_bytes = _decode_image_payload(resp2.json())
+        else:
+            png_bytes = _decode_image_payload(resp.json())
+    except Exception:
+        png_bytes = _local_cartoon_fallback(photo_bytes)
+        return png_bytes, True
+    finally:
+        t1 = time.time()
+        print(f"[cartoonize] {IMAGE_MODEL} total {t1 - t0:.2f}s, size={data.get('size')}")
 
-    # Sanity: ensure image has alpha; if not, still return (frontend can show over white)
-    # (If your org observes missing alpha on edits, we can switch to Responses API image_generation tool path next.)
-    if not _has_alpha(png_bytes):
-        # Not strictly failing—return as-is; printing still OK on white media.
-        return png_bytes
-
-    return png_bytes
+    # 3) Cache & return
+    cache_set("cartoon", photo_bytes, png_bytes, IMAGE_MODEL, IMG_SIZE, IMG_QUALITY, "v1")
+    return png_bytes, False

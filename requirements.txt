@@ -1,5 +1,7 @@
-flask
+Flask
 python-dotenv
+requests
 Pillow
 reportlab
-requests
+opencv-python
+numpy
